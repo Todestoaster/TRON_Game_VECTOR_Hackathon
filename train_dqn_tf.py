@@ -13,7 +13,7 @@ from game.constants import GRID_WIDTH, GRID_HEIGHT, CELL_SIZE
 SHOW_WINDOW = True  # True = Pygame und Matplotlib Fenster zeigen, False = nur Konsole
 
 PLAYER_COLORS = [(0, 255, 0), (186, 85, 211), (30, 144, 255)]  # Grün, Lila, Blau
-MODEL_DIRS = ["dqn_tron_tf_player1", "dqn_tron_tf_player2", "dqn_tron_tf_player3"]
+MODEL_DIRS = ["dqn_tron_tf_player1.keras", "dqn_tron_tf_player2.keras", "dqn_tron_tf_player3.keras"]
 STATE_FILES = ["train_state_player1.json", "train_state_player2.json", "train_state_player3.json"]
 HISTORY_FILES = ["reward_history_player1.json", "reward_history_player2.json", "reward_history_player3.json"]
 
@@ -45,10 +45,13 @@ def load_reward_history(filename):
 # === DQN Netzwerk ===
 def build_model(input_shape, n_actions):
     model = tf.keras.Sequential([
-        tf.keras.layers.Flatten(input_shape=input_shape),
+        tf.keras.layers.Input(shape=input_shape + (1,)),  # Kanal hinzufügen für Conv2D
+        tf.keras.layers.Conv2D(32, kernel_size=3, activation='relu', padding='same'),
+        tf.keras.layers.Conv2D(64, kernel_size=3, activation='relu', padding='same'),
+        tf.keras.layers.Flatten(),
         tf.keras.layers.Dense(256, activation='relu'),
         tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dense(n_actions)
+        tf.keras.layers.Dense(n_actions)  # Q-Werte für jede Aktion
     ])
     return model
 
@@ -93,7 +96,7 @@ def train():
 
     gamma = 0.99
     epsilon_final = 0.05
-    epsilon_decay = 0.01
+    epsilon_decay = 10000
     batch_size = 64
 
     starts = [load_training_state(file) for file in STATE_FILES]
@@ -101,10 +104,18 @@ def train():
     episode_starts = list(episode_starts)
     steps_done = list(steps_done)
 
-    histories = [load_reward_history(file) for file in HISTORY_FILES]
-    episode_numbers = [h[0] for h in histories]
-    rewards_plot = [h[1] for h in histories]
+    # === Korrigierte Initialisierung für History ===
+    episode_numbers = [[] for _ in range(3)]
+    rewards_plot = [[] for _ in range(3)]
 
+    for idx, file in enumerate(HISTORY_FILES):
+        if os.path.exists(file):
+            episodes, rewards = load_reward_history(file)
+            if episodes and rewards:
+                episode_numbers[idx] = episodes
+                rewards_plot[idx] = rewards
+
+    # === Modell Laden ===
     for i in range(3):
         if os.path.exists(MODEL_DIRS[i]):
             models[i] = tf.keras.models.load_model(MODEL_DIRS[i])
@@ -114,11 +125,14 @@ def train():
         for episode in tqdm(range(max(episode_starts), 100000)):
             state = env.reset()
             state = np.array(state, dtype=np.float32)
+            state = np.expand_dims(state, axis=-1)
             done = False
             episode_rewards = [0, 0, 0]
+            step_rewards = [[] for _ in range(3)]
 
             while not done:
                 actions = []
+            
                 for i in range(3):
                     epsilons[i] = epsilon_final + (1.0 - epsilon_final) * np.exp(-1. * steps_done[i] / epsilon_decay)
                     steps_done[i] += 1
@@ -130,11 +144,37 @@ def train():
                         actions.append(np.argmax(q_values[0]))
 
                 next_state, rewards, done, _ = env.step(actions)
+
+                # === Reward Shaping ===
+                original_rewards = rewards.copy()  # Originale Rewards sichern!
+
+                alive_players = [i for i in range(3) if rewards[i] > -1.0]  # Lebende Spieler
+
+                for i in range(3):
+                    if original_rewards[i] == -1.0:  # Spieler ist gestorben
+                        rewards[i] -= 10.0  # Strafe für Tod
+
+                        if env.death_reason[i] == "self":
+                            rewards[i] -= 10.0  # Extra Strafe für Selbstkollision
+                    else:
+                        rewards[i] += 0.01  # Kleine Belohnung fürs Überleben
+
+                # Bonus: Gegner sind gestorben
+                num_dead = 3 - len(alive_players)
+                for i in alive_players:
+                    rewards[i] += 2.0 * num_dead
+                    if len(alive_players) == 1:  # Nur einer lebt
+                        rewards[i] += 5.0
+
+
+
+
                 next_state = np.array(next_state, dtype=np.float32)
+                next_state = np.expand_dims(next_state, axis=-1)
 
                 for i in range(3):
                     buffers[i].push(state, actions[i], rewards[i], next_state, done)
-                    episode_rewards[i] += rewards[i]
+                    step_rewards[i].append(rewards[i])
 
                 state = next_state
 
@@ -175,19 +215,23 @@ def train():
                     clock.tick(15)
 
             for i in range(3):
-                rewards_plot[i].append(episode_rewards[i])
+                mean_reward = np.mean(step_rewards[i])  # <<< Mittelwert korrekt
+                rewards_plot[i].append(mean_reward)      # <<< Korrekt mean_reward speichern
                 episode_numbers[i].append(episode)
 
+            # === Plot alle 10 Episoden ===
             if SHOW_WINDOW and episode % 10 == 0:
                 ax.clear()
                 for idx in range(3):
-                    ax.plot(episode_numbers[idx], rewards_plot[idx], label=f"P{idx+1}", color=np.array(PLAYER_COLORS[idx])/255)
+                    if len(episode_numbers[idx]) > 0:
+                        ax.plot(episode_numbers[idx], rewards_plot[idx], label=f"P{idx+1}", color=np.array(PLAYER_COLORS[idx])/255)
                 ax.set_xlabel("Episode")
                 ax.set_ylabel("Reward")
                 ax.set_title("Training Progress")
                 ax.legend()
                 plt.pause(0.01)
 
+            # === Speichern alle 100 Episoden ===
             if episode % 100 == 0:
                 for i in range(3):
                     models[i].save(MODEL_DIRS[i])
